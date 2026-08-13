@@ -676,7 +676,7 @@ def import_daily_trades(parsed: pd.DataFrame, holdings: pd.DataFrame, state: dic
 # ------------------------------------------------------------------ #
 # 페이지 설정
 # ------------------------------------------------------------------ #
-st.set_page_config(page_title="SP Orchestra", page_icon="◆", layout="centered")
+st.set_page_config(page_title="SP Orchestra-test", page_icon="◆", layout="centered")
 
 if "theme" not in st.session_state:
     st.session_state["theme"] = "light"

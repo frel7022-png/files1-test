@@ -7,6 +7,9 @@
 """
 
 import calendar
+import base64
+import hashlib
+import io
 import uuid
 from datetime import datetime, date
 from pathlib import Path
@@ -24,10 +27,11 @@ HOLDINGS_FILE = HERE / "portfolio_data.csv"
 TX_FILE = HERE / "transactions.csv"
 STATE_FILE = HERE / "account_state.csv"
 HISTORY_FILE = HERE / "asset_history.csv"
+SECTOR_HISTORY_FILE = HERE / "sector_history.csv"
+IMPORT_LOG_FILE = HERE / "import_log.csv"
 
 HOLD_COLUMNS = ["종목명", "종목코드", "섹터", "수량", "평단가", "현재가", "등락률", "업데이트시각"]
 TX_COLUMNS = ["id", "날짜", "종목명", "구분", "수량", "단가", "실현손익", "메모", "정산반영"]
-EDIT_COLUMNS = ["종목명", "섹터", "수량", "평단가", "현재가"]
 
 UP_COLOR = "#d9364f"    # 국내 관례: 상승/이익 = 빨강
 DOWN_COLOR = "#2b6cd4"  # 하락/손실 = 파랑
@@ -37,6 +41,64 @@ SECTOR_PALETTE = [
     "#2DD4BF", "#F5A623", "#A78BFA", "#34D399", "#F472B6",
     "#FBBF24", "#60A5FA", "#F87171", "#C084FC", "#38BDF8", "#FB923C",
 ]
+
+# 섹터 비중 보기 전용 그룹 매핑 (종목별 보유현황의 세부 섹터는 그대로 유지됨)
+SECTOR_GROUP_MAP = {
+    "유통": "유통 물류",
+    "물류": "유통 물류",
+    "반도체소재": "반도체",
+    "반도체장비": "반도체",
+    "인터넷": "반도체",
+    "건자재": "건설",
+    "건설": "건설",
+    "제지": "소비재",
+    "섬유의류": "소비재",
+    "화장품": "소비재",
+    "가구": "소비재",
+    "제약바이오": "의료바이오",
+    "제약바이어": "의료바이오",  # 오타 대비
+    "의료기기": "의료바이오",
+    "해운": "해운",
+    "조선": "해운",
+    "엔터테인먼트": "엔터",
+    "게임": "엔터",
+    "렌탈서비스": "서비스",
+    "에너지기자재": "에너지",
+    "지주(에너지)": "에너지",
+    "에너지": "에너지",
+    "지주(방산소재)": "방산",
+    "금속가공": "금속철강",
+    "전자부품": "전기전자",
+    "전기전자부품": "전기전자",
+}
+
+# 종목명 → 섹터 자동 매핑 (신규 종목이 CSV로 들어올 때 "미분류" 대신 자동 지정, 기존 미분류 종목도 자동 보정)
+STOCK_SECTOR_MAP = {
+    "유한양행": "제약바이오",
+    "사조대림": "식품",
+    "SGC에너지": "에너지",
+    "크라운해태홀딩스": "식품",
+    "서흥": "제약바이오",
+    "율촌화학": "제지",
+    "한샘": "가구",
+    "계룡건설": "건설",
+    "이마트": "유통",
+    "필옵틱스": "반도체장비",
+    "종근당": "제약바이오",
+    "심텍": "반도체장비",
+    "한화시스템": "지주(방산소재)",
+}
+
+# 섹터별 목표 비중(주식 총자산 대비, %). 아직 정하지 않은 섹터는 포함하지 않음 — 추후 추가.
+SECTOR_TARGETS = {
+    "식품": 30.0,
+    "소비재": 20.0,
+}
+
+
+def group_sector(sector: str) -> str:
+    """섹터 비중 보기용 그룹명 반환. 매핑에 없으면 원래 섹터명 그대로."""
+    return SECTOR_GROUP_MAP.get(sector, sector)
 
 THEMES = {
     "dark": {
@@ -79,9 +141,103 @@ def clean_str(x) -> str:
 
 
 # ------------------------------------------------------------------ #
+# GitHub 데이터 동기화 (재배포/컨테이너 재시작으로 로컬 CSV가 사라져도 복구되게)
+# ------------------------------------------------------------------ #
+def _github_cfg():
+    """.streamlit/secrets.toml 의 [github] 섹션에서 설정을 읽어옴.
+    예:
+        [github]
+        token = "ghp_xxx..."
+        repo = "username/reponame"
+        branch = "main"
+        # path_prefix = "data/"   # 선택: 레포 내 하위 폴더에 저장하고 싶을 때
+    미설정 시 GitHub 동기화 없이 로컬 디스크만 사용(조용히 스킵).
+    """
+    try:
+        gh = st.secrets["github"]
+        return gh["token"], gh["repo"], gh.get("branch", "main"), gh.get("path_prefix", "")
+    except Exception:
+        return None, None, None, None
+
+
+def _github_api_url(local_path: Path, prefix: str) -> str:
+    token, repo, branch, _ = _github_cfg()
+    file_path = f"{prefix}{local_path.name}" if prefix else local_path.name
+    return f"https://api.github.com/repos/{repo}/contents/{file_path}"
+
+
+def _github_log(filename: str, action: str, ok: bool, detail: str = "") -> None:
+    log = st.session_state.setdefault("github_sync_log", [])
+    log.append({"file": filename, "action": action, "ok": ok, "detail": detail})
+    st.session_state["github_sync_log"] = log[-30:]  # 최근 30건만 유지
+
+
+def github_fetch_file(local_path: Path) -> bool:
+    """로컬에 파일이 없을 때 GitHub 레포의 최신본을 받아와 로컬에 저장. 성공 시 True."""
+    token, repo, branch, prefix = _github_cfg()
+    if not token:
+        return False
+    try:
+        url = _github_api_url(local_path, prefix)
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+        r = requests.get(url, headers=headers, params={"ref": branch}, timeout=10)
+        if r.status_code == 200:
+            content = base64.b64decode(r.json()["content"])
+            local_path.write_bytes(content)
+            _github_log(local_path.name, "fetch", True)
+            return True
+        elif r.status_code == 404:
+            _github_log(local_path.name, "fetch", False, "GitHub에 이 파일이 아직 없음(404) — 신규 생성 예정")
+        else:
+            _github_log(local_path.name, "fetch", False, f"HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        _github_log(local_path.name, "fetch", False, f"예외: {e}")
+    return False
+
+
+def github_commit_file(local_path: Path, message: str) -> bool:
+    """로컬 CSV 저장 직후, GitHub 레포에도 동일 내용을 커밋(생성 또는 업데이트). 성공 시 True."""
+    token, repo, branch, prefix = _github_cfg()
+    if not token:
+        _github_log(local_path.name, "commit", False, "GitHub secrets(token)이 설정되어 있지 않음")
+        return False
+    if not local_path.exists():
+        _github_log(local_path.name, "commit", False, "로컬 파일이 존재하지 않음")
+        return False
+    try:
+        url = _github_api_url(local_path, prefix)
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+        content_b64 = base64.b64encode(local_path.read_bytes()).decode()
+
+        sha = None
+        r = requests.get(url, headers=headers, params={"ref": branch}, timeout=10)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        elif r.status_code not in (200, 404):
+            _github_log(local_path.name, "commit", False, f"sha 조회 실패 HTTP {r.status_code}: {r.text[:200]}")
+            return False
+
+        payload = {"message": message, "content": content_b64, "branch": branch}
+        if sha:
+            payload["sha"] = sha
+        put_r = requests.put(url, headers=headers, json=payload, timeout=10)
+        if put_r.status_code in (200, 201):
+            _github_log(local_path.name, "commit", True)
+            return True
+        else:
+            _github_log(local_path.name, "commit", False, f"HTTP {put_r.status_code}: {put_r.text[:300]}")
+            return False
+    except Exception as e:
+        _github_log(local_path.name, "commit", False, f"예외: {e}")
+        return False
+
+
+# ------------------------------------------------------------------ #
 # 데이터 로드 / 저장
 # ------------------------------------------------------------------ #
 def load_holdings() -> pd.DataFrame:
+    if not HOLDINGS_FILE.exists():
+        github_fetch_file(HOLDINGS_FILE)
     if HOLDINGS_FILE.exists():
         df = pd.read_csv(HOLDINGS_FILE, dtype={"종목코드": str}, keep_default_na=False, na_values=[""])
         for col in HOLD_COLUMNS:
@@ -91,15 +247,22 @@ def load_holdings() -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
         for col in ("종목명", "종목코드", "섹터", "업데이트시각"):
             df[col] = df[col].apply(clean_str)
+        # 미분류 종목명이 STOCK_SECTOR_MAP에 등록돼 있으면 자동으로 섹터 보정
+        needs_fix = (df["섹터"].isin(["", "미분류"])) & (df["종목명"].isin(STOCK_SECTOR_MAP.keys()))
+        if needs_fix.any():
+            df.loc[needs_fix, "섹터"] = df.loc[needs_fix, "종목명"].map(STOCK_SECTOR_MAP)
         return df[HOLD_COLUMNS]
     return pd.DataFrame(columns=HOLD_COLUMNS)
 
 
 def save_holdings(df: pd.DataFrame) -> None:
     df.to_csv(HOLDINGS_FILE, index=False)
+    github_commit_file(HOLDINGS_FILE, "portfolio_data.csv 업데이트")
 
 
 def load_transactions() -> pd.DataFrame:
+    if not TX_FILE.exists():
+        github_fetch_file(TX_FILE)
     if TX_FILE.exists():
         df = pd.read_csv(TX_FILE, dtype={"id": str}, keep_default_na=False, na_values=[""])
         for col in TX_COLUMNS:
@@ -111,9 +274,12 @@ def load_transactions() -> pd.DataFrame:
 
 def save_transactions(df: pd.DataFrame) -> None:
     df.to_csv(TX_FILE, index=False)
+    github_commit_file(TX_FILE, "transactions.csv 업데이트")
 
 
 def load_state() -> dict:
+    if not STATE_FILE.exists():
+        github_fetch_file(STATE_FILE)
     if STATE_FILE.exists():
         df = pd.read_csv(STATE_FILE)
         return {"cash": float(df.loc[0, "예수금"]), "initial": float(df.loc[0, "최초자본"])}
@@ -122,9 +288,12 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     pd.DataFrame([{"예수금": state["cash"], "최초자본": state["initial"]}]).to_csv(STATE_FILE, index=False)
+    github_commit_file(STATE_FILE, "account_state.csv 업데이트")
 
 
 def load_history() -> pd.DataFrame:
+    if not HISTORY_FILE.exists():
+        github_fetch_file(HISTORY_FILE)
     if HISTORY_FILE.exists():
         return pd.read_csv(HISTORY_FILE)
     return pd.DataFrame(columns=["날짜", "총자산", "조정자산"])
@@ -132,6 +301,7 @@ def load_history() -> pd.DataFrame:
 
 def save_history(df: pd.DataFrame) -> None:
     df.to_csv(HISTORY_FILE, index=False)
+    github_commit_file(HISTORY_FILE, "asset_history.csv 업데이트")
 
 
 def snapshot_history(total_assets: float, adjusted_assets: float) -> None:
@@ -143,10 +313,68 @@ def snapshot_history(total_assets: float, adjusted_assets: float) -> None:
     save_history(hist)
 
 
+def load_sector_history() -> pd.DataFrame:
+    if not SECTOR_HISTORY_FILE.exists():
+        github_fetch_file(SECTOR_HISTORY_FILE)
+    if SECTOR_HISTORY_FILE.exists():
+        return pd.read_csv(SECTOR_HISTORY_FILE)
+    return pd.DataFrame(columns=["날짜", "섹터그룹", "비중"])
+
+
+def save_sector_history(df: pd.DataFrame) -> None:
+    df.to_csv(SECTOR_HISTORY_FILE, index=False)
+    github_commit_file(SECTOR_HISTORY_FILE, "sector_history.csv 업데이트")
+
+
+def snapshot_sector_history(weights: dict) -> None:
+    """섹터그룹별 오늘자 비중(주식 총자산 대비 %) 스냅샷 저장. 같은 날짜 데이터는 덮어씀."""
+    if not weights:
+        return
+    hist = load_sector_history()
+    d = today_kst_str()
+    hist = hist[hist["날짜"] != d]
+    new_rows = pd.DataFrame([{"날짜": d, "섹터그룹": k, "비중": v} for k, v in weights.items()])
+    hist = pd.concat([hist, new_rows], ignore_index=True)
+    hist = hist.sort_values(["날짜", "섹터그룹"])
+    save_sector_history(hist)
+
+
 # ------------------------------------------------------------------ #
 # 네이버 금융: 종목명 → 종목코드 자동 검색 + 시세 조회
 # ------------------------------------------------------------------ #
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def get_current_prices_for_names(names: list[str]) -> dict:
+    """종목명 리스트의 현재가 조회. 보유 여부와 무관 — 청산된 종목 추적용."""
+    name_to_code = {}
+    for n in names:
+        code = resolve_code(n)
+        if code:
+            name_to_code[n] = code
+    quotes = fetch_quotes(list(name_to_code.values()))
+    result = {}
+    for n, code in name_to_code.items():
+        if code in quotes:
+            result[n] = quotes[code]["price"]
+    return result
+
+
+def get_closed_out_last_sells(holdings_df: pd.DataFrame, tx_df: pd.DataFrame) -> pd.DataFrame:
+    """현재 보유 중이 아닌(=완전히 매도한) 종목들의 마지막 매도일/매도가."""
+    sell_tx = tx_df[tx_df["구분"] == "매도"].copy()
+    if sell_tx.empty:
+        return pd.DataFrame(columns=["종목명", "매도일", "매도가"])
+    sell_tx["단가"] = pd.to_numeric(sell_tx["단가"], errors="coerce")
+    held_names = set(holdings_df["종목명"].tolist())
+    sell_tx = sell_tx[~sell_tx["종목명"].isin(held_names)]
+    sell_tx = sell_tx[sell_tx["단가"].notna() & (sell_tx["단가"] > 0)]
+    if sell_tx.empty:
+        return pd.DataFrame(columns=["종목명", "매도일", "매도가"])
+    sell_tx = sell_tx.sort_values(["종목명", "날짜", "id"])
+    last = sell_tx.groupby("종목명", as_index=False).tail(1)[["종목명", "날짜", "단가"]]
+    last = last.rename(columns={"날짜": "매도일", "단가": "매도가"})
+    return last.reset_index(drop=True)
+
+
 def resolve_code(name: str):
     name = (name or "").strip()
     if not name:
@@ -267,6 +495,19 @@ def compute_metrics(df: pd.DataFrame, cash: float):
     return df, stock_valuation, total_assets, unrealized_loss
 
 
+def compute_sector_weights(df: pd.DataFrame) -> dict:
+    """섹터그룹별 비중(%). 주식 평가금액 총합 대비이며 예수금은 포함하지 않음."""
+    if df.empty:
+        return {}
+    d = df.copy()
+    d["섹터그룹"] = d["섹터"].apply(group_sector)
+    stock_total = d["평가금액"].sum()
+    if stock_total <= 0:
+        return {}
+    grp = d.groupby("섹터그룹")["평가금액"].sum()
+    return (grp / stock_total * 100).to_dict()
+
+
 # ------------------------------------------------------------------ #
 # 거래 반영 (매수/매도)
 # ------------------------------------------------------------------ #
@@ -290,7 +531,7 @@ def apply_transaction(holdings: pd.DataFrame, state: dict, name: str, kind: str,
                 holdings.loc[i, "현재가"] = price
         else:
             new_row = {c: "" for c in HOLD_COLUMNS}
-            new_row.update({"종목명": name, "종목코드": "", "섹터": "미분류",
+            new_row.update({"종목명": name, "종목코드": "", "섹터": STOCK_SECTOR_MAP.get(name, "미분류"),
                              "수량": qty, "평단가": price, "현재가": price,
                              "등락률": 0, "업데이트시각": now_kst_str()})
             holdings = pd.concat([holdings, pd.DataFrame([new_row])], ignore_index=True)
@@ -311,6 +552,125 @@ def apply_transaction(holdings: pd.DataFrame, state: dict, name: str, kind: str,
             realized = 0.0
 
     return holdings, state, realized
+
+
+def load_import_log() -> pd.DataFrame:
+    if not IMPORT_LOG_FILE.exists():
+        github_fetch_file(IMPORT_LOG_FILE)
+    if IMPORT_LOG_FILE.exists():
+        return pd.read_csv(IMPORT_LOG_FILE, dtype=str)
+    return pd.DataFrame(columns=["hash", "날짜", "처리시각"])
+
+
+def save_import_log(df: pd.DataFrame) -> None:
+    df.to_csv(IMPORT_LOG_FILE, index=False)
+    github_commit_file(IMPORT_LOG_FILE, "import_log.csv 업데이트")
+
+
+def parse_broker_daily_csv(raw: bytes) -> pd.DataFrame:
+    """증권사 일일 매매일지 CSV(잔고/금일매수/금일매도 구조)를 파싱.
+    컬럼명이 병합헤더+개행문자라 인식이 불안정하므로 '위치(열 순서)' 기준으로 읽는다.
+    기대 열 순서: [상세, 종목명, 잔고구분, 잔고수량, 잔고평균단가,
+                  매수평균가, 매수수량, 매수금액, 매도평균가, 매도수량, 매도금액,
+                  수수료, 실현손익(증권사), 손익률, ...]
+    """
+    text = None
+    for enc in ("cp949", "utf-8-sig", "utf-8"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError("CSV 인코딩을 인식할 수 없습니다 (cp949/utf-8 모두 실패).")
+
+    df = pd.read_csv(io.StringIO(text))
+    if len(df) < 2 or df.shape[1] < 13:
+        raise ValueError("예상한 매매일지 형식이 아닙니다 (열 개수 부족).")
+
+    # 첫 데이터 행은 '평균가/수량/매입금액...' 서브헤더이므로 건너뜀
+    df = df.iloc[1:].reset_index(drop=True)
+    c = df.columns.tolist()
+
+    def num(series):
+        return pd.to_numeric(
+            series.astype(str).str.replace(",", "").str.strip(), errors="coerce"
+        ).fillna(0)
+
+    out = pd.DataFrame({
+        "종목명": df[c[1]].astype(str).str.strip(),
+        "매수평균가": num(df[c[5]]),
+        "매수수량": num(df[c[6]]),
+        "매도평균가": num(df[c[8]]),
+        "매도수량": num(df[c[9]]),
+        "실현손익_증권사": num(df[c[12]]),
+    })
+    out = out[out["종목명"].notna() & (out["종목명"] != "") & (out["종목명"].str.lower() != "nan")]
+    return out.reset_index(drop=True)
+
+
+def rebuild_portfolio_from_transactions(tx: pd.DataFrame, initial_capital: float):
+    """transactions.csv 전체를 날짜순으로 처음부터 재생하여 holdings/state/실현손익을 다시 계산.
+    같은 날짜의 CSV 매매일지를 여러 번 업로드해도(=그 날짜 거래가 통째로 교체됨) 항상
+    '최신 업로드 기준'의 정확한 최종 상태가 되도록 하는 단일 진실 공급원(source of truth) 방식."""
+    holdings = pd.DataFrame(columns=HOLD_COLUMNS)
+    state = {"cash": initial_capital, "initial": initial_capital}
+
+    if tx.empty:
+        return holdings, state, tx
+
+    tx_sorted = tx.copy().reset_index(drop=True)
+    tx_sorted["_ord"] = range(len(tx_sorted))
+    tx_sorted = tx_sorted.sort_values(["날짜", "_ord"]).reset_index(drop=True)
+
+    realized_map = {}
+    for _, row in tx_sorted.iterrows():
+        name = row["종목명"]
+        kind = row["구분"]
+        qty = float(row["수량"])
+        price = float(row["단가"])
+        holdings, state, realized = apply_transaction(holdings, state, name, kind, qty, price)
+        if kind == "매도":
+            realized_map[row["id"]] = realized if realized is not None else 0.0
+
+    tx = tx.copy()
+    for tid, val in realized_map.items():
+        tx.loc[tx["id"] == tid, "실현손익"] = val
+
+    return holdings, state, tx
+
+
+def import_daily_trades(parsed: pd.DataFrame, holdings: pd.DataFrame, state: dict,
+                         tx: pd.DataFrame, trade_date: str):
+    """해당 날짜의 매매일지를 반영.
+    증권사 CSV는 '그날 하루 전체 누적' 내역이므로, 같은 날짜에 이미 CSV로 반영된 거래가
+    있으면 전부 지우고 이번 업로드분으로 교체한 뒤, 거래 기록 전체를 처음부터 재생해서
+    holdings/state를 다시 계산한다 (그래야 같은 날 여러 번 올려도 중복 반영되지 않음)."""
+    tx = tx.copy()
+    prior_mask = (tx["날짜"] == trade_date) & (tx["메모"] == "CSV 업로드")
+    replaced_count = int(prior_mask.sum())
+    tx = tx[~prior_mask].reset_index(drop=True)
+
+    new_rows = []
+    for _, r in parsed.iterrows():
+        name = r["종목명"]
+        if r["매수수량"] > 0 and r["매수평균가"] > 0:
+            new_rows.append({
+                "id": str(uuid.uuid4())[:8], "날짜": trade_date, "종목명": name, "구분": "매수",
+                "수량": r["매수수량"], "단가": r["매수평균가"], "실현손익": "",
+                "메모": "CSV 업로드", "정산반영": True,
+            })
+        if r["매도수량"] > 0 and r["매도평균가"] > 0:
+            new_rows.append({
+                "id": str(uuid.uuid4())[:8], "날짜": trade_date, "종목명": name, "구분": "매도",
+                "수량": r["매도수량"], "단가": r["매도평균가"], "실현손익": "",
+                "메모": "CSV 업로드", "정산반영": True,
+            })
+    if new_rows:
+        tx = pd.concat([tx, pd.DataFrame(new_rows)], ignore_index=True)
+
+    holdings2, state2, tx2 = rebuild_portfolio_from_transactions(tx, state.get("initial", 10_000_000.0))
+    return holdings2, state2, tx2, len(new_rows), replaced_count
 
 
 # ------------------------------------------------------------------ #
@@ -339,6 +699,35 @@ st.markdown(f"""
     #MainMenu, footer, header {{ visibility: hidden; }}
     h1, h2, h3, h4, h5, p, span, label, div {{ color: {T['text']}; }}
 
+    /* 파일 업로드 위젯: 기본 다크 배경 대신 앱 테마에 맞춤 */
+    section[data-testid="stFileUploaderDropzone"] {{
+        background: {T['card2']} !important;
+        border: 1px dashed {T['border']} !important;
+        border-radius: 10px !important;
+    }}
+    section[data-testid="stFileUploaderDropzone"] * {{
+        color: {T['text']} !important;
+    }}
+    section[data-testid="stFileUploaderDropzone"] small,
+    section[data-testid="stFileUploaderDropzone"] span {{
+        color: {T['muted']} !important;
+    }}
+    section[data-testid="stFileUploaderDropzone"] button {{
+        background: {T['card']} !important;
+        color: {T['text']} !important;
+        border: 1px solid {T['border']} !important;
+    }}
+    div[data-testid="stFileUploaderFile"],
+    div[data-testid="stFileUploaderFileName"] {{
+        background: {T['card']} !important;
+        border: 1px solid {T['border']} !important;
+        border-radius: 8px !important;
+        color: {T['text']} !important;
+    }}
+    div[data-testid="stFileUploaderFile"] * {{
+        color: {T['text']} !important;
+    }}
+
     .summary-box {{ background:{T['card']}; border:1px solid {T['border']}; border-radius:14px; padding:18px 20px; margin-bottom:14px; }}
     .summary-label {{ color:{T['muted']}; font-size:13px; margin-bottom:4px; }}
     .summary-main {{ font-size:28px; font-weight:800; line-height:1.2; }}
@@ -361,6 +750,25 @@ st.markdown(f"""
     .legend-item {{ display:flex; align-items:center; gap:5px; font-size:12px; color:{T['text']}; }}
     .legend-dot {{ width:8px; height:8px; border-radius:99px; flex-shrink:0; }}
     .legend-pct {{ color:{T['muted']}; font-family: ui-monospace, monospace; }}
+
+    .sector-bar-list {{ margin-top:10px; }}
+    .sector-bar-row {{ display:flex; align-items:center; gap:6px; margin-bottom:14px; }}
+    .sector-bar-label {{ font-size:11px; font-weight:600; color:{T['text']}; width:64px; flex-shrink:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+    .sector-bar-track {{ position:relative; flex:1; height:14px; background:{T['card']}; border:1px solid {T['border']}; border-radius:999px; overflow:visible; }}
+    .sector-bar-fill {{ position:absolute; left:1px; top:1px; bottom:1px; border-radius:999px; }}
+    .sector-target-marker {{ position:absolute; top:-2px; bottom:-2px; width:2px; background:{T['text']}; opacity:0.55; }}
+    .sector-target-label {{ position:absolute; top:100%; margin-top:2px; transform:translateX(-50%); font-size:9.5px; color:{T['muted2']}; white-space:nowrap; }}
+    .sector-bar-pct {{ font-size:12px; color:{T['muted']}; width:64px; flex-shrink:0; text-align:right; font-family: ui-monospace, monospace; white-space:nowrap; }}
+    .sector-bar-pct .cur {{ font-weight:700; color:{T['text']}; }}
+    .sector-bar-pct .delta {{ margin-left:3px; }}
+    .sector-stock-names {{ font-size:10.5px; color:{T['muted2']}; margin:2px 0 0 2px; }}
+
+    .updown-row {{ display:flex; align-items:center; gap:8px; padding:7px 2px; border-bottom:1px solid {T['border']}; font-size:12.5px; }}
+    .updown-row:last-child {{ border-bottom:none; }}
+    .updown-row .name {{ font-weight:700; color:{T['text']}; flex:1; }}
+    .updown-row .pct {{ font-weight:700; font-family: ui-monospace, monospace; width:62px; text-align:right; }}
+    .updown-row .detail {{ font-size:11px; color:{T['muted']}; font-family: ui-monospace, monospace; width:118px; text-align:right; }}
+
 
     .stock-card {{ background:{T['card']}; border:1px solid {T['border']}; border-radius:12px; padding:10px 16px; margin-bottom:7px; }}
     .stock-top {{ display:flex; justify-content:space-between; align-items:baseline; }}
@@ -388,14 +796,14 @@ st.markdown(f"""
         color: {T['text']} !important;
         border: 1px solid {T['border']} !important;
         box-shadow: none !important;
-        border-radius: 10px;
+        border-radius: 8px;
         font-weight: 600;
-        font-size: 12px;
+        font-size: 11px;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        padding-left: 0.35rem;
-        padding-right: 0.35rem;
+        padding: 0.2rem 0.35rem;
+        min-height: 1.7rem;
     }}
     div.stButton > button p {{ color: {T['text']} !important; }}
     div.stFormSubmitButton > button,
@@ -593,6 +1001,18 @@ holdings = load_holdings()
 state = load_state()
 tx = load_transactions()
 
+top_l, top_r = st.columns([5, 2])
+with top_r:
+    refresh_clicked_top = st.button("시세 새로고침", use_container_width=True, key="refresh_btn_top")
+
+if refresh_clicked_top:
+    with st.spinner("종목명으로 시세를 찾는 중..."):
+        holdings = refresh_all_prices(holdings)
+        df_top, stock_val_top, total_assets_top, unreal_top = compute_metrics(holdings, state["cash"])
+        snapshot_history(total_assets_top, total_assets_top + unreal_top)
+        snapshot_sector_history(compute_sector_weights(df_top))
+    st.rerun()
+
 tab_port, tab_tx = st.tabs(["포트폴리오", "거래 기록"])
 
 # ==================================================================== #
@@ -620,30 +1040,22 @@ with tab_port:
     daily_color = UP_COLOR if daily_pnl > 0 else (DOWN_COLOR if daily_pnl < 0 else T["muted"])
     daily_sign = "+" if daily_pnl > 0 else ""
 
-    # ---- 오늘의 거래 요약 (매수/매도 종목별 총금액) ----
+    # ---- 오늘의 거래 요약 (매수/매도 총금액) ----
     buy_tx = today_tx[today_tx["구분"] == "매수"].copy()
     sell_tx = today_tx[today_tx["구분"] == "매도"].copy()
-    buy_tx["총금액"] = pd.to_numeric(buy_tx["수량"], errors="coerce") * pd.to_numeric(buy_tx["단가"], errors="coerce")
-    sell_tx["총금액"] = pd.to_numeric(sell_tx["수량"], errors="coerce") * pd.to_numeric(sell_tx["단가"], errors="coerce")
-    buy_by_stock = buy_tx.groupby("종목명")["총금액"].sum().sort_values(ascending=False)
-    sell_by_stock = sell_tx.groupby("종목명")["총금액"].sum().sort_values(ascending=False)
+    buy_total_amt = (pd.to_numeric(buy_tx["수량"], errors="coerce") * pd.to_numeric(buy_tx["단가"], errors="coerce")).sum()
+    sell_total_amt = (pd.to_numeric(sell_tx["수량"], errors="coerce") * pd.to_numeric(sell_tx["단가"], errors="coerce")).sum()
     total_trade_count = len(today_tx)
-
-    def _chips(series):
-        if series.empty:
-            return '<span class="trade-chip">없음</span>'
-        return "".join(
-            f'<span class="trade-chip">{name} <b>{amt:,.0f}원</b></span>'
-            for name, amt in series.items()
-        )
 
     daily_trade_html = f"""
     <div class="daily-trade-box">
         <div class="daily-trade-count">일일거래 총 {total_trade_count}회
             <span>(매수 {len(buy_tx)}건 · 매도 {len(sell_tx)}건)</span>
         </div>
-        <div class="daily-trade-row"><span class="tag-label" style="color:{UP_COLOR}">매수</span>{_chips(buy_by_stock)}</div>
-        <div class="daily-trade-row"><span class="tag-label" style="color:{DOWN_COLOR}">매도</span>{_chips(sell_by_stock)}</div>
+        <div class="daily-trade-row"><span class="tag-label" style="color:{UP_COLOR}">매수</span>
+            <span class="trade-chip"><b>{buy_total_amt:,.0f}원</b></span></div>
+        <div class="daily-trade-row"><span class="tag-label" style="color:{DOWN_COLOR}">매도</span>
+            <span class="trade-chip"><b>{sell_total_amt:,.0f}원</b></span></div>
     </div>
     """
 
@@ -667,12 +1079,19 @@ with tab_port:
     </div>
     """, unsafe_allow_html=True)
 
-    # ---- 섹터 비중 도넛 ----
+    # ---- 섹터 비중 도넛 + 목표 비중 관리 ----
     with st.expander("섹터 비중 보기", expanded=False):
         include_cash = st.toggle("예수금 포함", value=st.session_state.get("include_cash", True), key="cash_toggle")
         st.session_state["include_cash"] = include_cash
 
-        sector_val = df.groupby("섹터")["평가금액"].sum().to_dict()
+        # 도넛/막대 공통 색상: 주식(예수금 제외) 비중 기준으로 순위를 매겨 고정 배정
+        stock_weights = compute_sector_weights(df)  # {섹터그룹: 주식 총자산 대비 %}
+        stock_weight_rank = sorted(stock_weights.items(), key=lambda x: x[1], reverse=True)
+        color_map = {name: SECTOR_PALETTE[i % len(SECTOR_PALETTE)] for i, (name, _) in enumerate(stock_weight_rank)}
+
+        df_grp = df.copy()
+        df_grp["섹터그룹"] = df_grp["섹터"].apply(group_sector)
+        sector_val = df_grp.groupby("섹터그룹")["평가금액"].sum().to_dict()
         if include_cash and state["cash"] > 0:
             sector_val[CASH_LABEL] = state["cash"]
         sector_items = sorted(sector_val.items(), key=lambda x: x[1], reverse=True)
@@ -681,10 +1100,7 @@ with tab_port:
         if denom > 0 and sector_items:
             labels = [s for s, _ in sector_items]
             values = [v for _, v in sector_items]
-            colors = [SECTOR_PALETTE[i % len(SECTOR_PALETTE)] for i in range(len(labels))]
-            cash_idx = labels.index(CASH_LABEL) if CASH_LABEL in labels else None
-            if cash_idx is not None:
-                colors[cash_idx] = T["cash_dot"]
+            colors = [color_map.get(lbl, T["cash_dot"] if lbl == CASH_LABEL else T["muted2"]) for lbl in labels]
 
             fig, ax = plt.subplots(figsize=(4.6, 4.6))
             fig.patch.set_alpha(0)
@@ -704,6 +1120,148 @@ with tab_port:
             st.markdown(legend_html, unsafe_allow_html=True)
         else:
             st.info("종목/예수금 데이터가 있으면 섹터 비중이 표시됩니다.")
+
+        # ---- 섹터별 현재 비중 막대 (주식 총자산 대비, 예수금 제외) + 목표 비중 ----
+        if stock_weight_rank:
+            st.markdown('<div style="height:22px"></div>', unsafe_allow_html=True)
+
+            sec_stocks = df_grp.groupby("섹터그룹")["종목명"].apply(lambda s: ", ".join(s)).to_dict()
+
+            sec_hist = load_sector_history()
+            prev_weights = {}
+            if not sec_hist.empty:
+                today_str_ = today_kst_str()
+                past_dates = sorted(d for d in sec_hist["날짜"].unique() if d < today_str_)
+                if past_dates:
+                    prev_date = past_dates[-1]
+                    prev_weights = sec_hist[sec_hist["날짜"] == prev_date].set_index("섹터그룹")["비중"].to_dict()
+
+            if st.session_state.get("sector_trend_pick") not in stock_weights:
+                st.session_state.sector_trend_pick = None
+
+            SCALE_MAX = 40.0  # 종목 특성상 한 섹터가 40%를 넘지 않는다는 전제의 고정 스케일(배터리 게이지 방식)
+
+            for name, pct in stock_weight_rank:
+                color = color_map.get(name, "#888")
+                width_pct = max(min(pct / SCALE_MAX * 100, 100), 0)
+                target = SECTOR_TARGETS.get(name)
+                target_marker = ""
+                target_sublabel = ""
+                if target is not None:
+                    target_pos = max(min(target / SCALE_MAX * 100, 100), 0)
+                    target_marker = f'<div class="sector-target-marker" style="left:{target_pos}%"></div>'
+                    target_sublabel = f'<div class="sector-target-label" style="left:{target_pos}%">{target:.0f}%</div>'
+                delta_html = ""
+                if name in prev_weights:
+                    delta = pct - prev_weights[name]
+                    if abs(delta) >= 0.05:
+                        dcolor = UP_COLOR if delta > 0 else DOWN_COLOR
+                        dsign = "+" if delta > 0 else ""
+                        delta_html = f'<span class="delta" style="color:{dcolor}">{dsign}{delta:.1f}%p</span>'
+
+                is_open = st.session_state.sector_trend_pick == name
+                c1, c2, c3 = st.columns([1.05, 3.1, 1.4])
+                with c1:
+                    label = f"▾ {name}" if is_open else name
+                    if st.button(label, key=f"sector_pick_{name}", use_container_width=True):
+                        st.session_state.sector_trend_pick = None if is_open else name
+                        st.rerun()
+                with c2:
+                    st.markdown(
+                        f'<div class="sector-bar-track">'
+                        f'<div class="sector-bar-fill" style="background:{color}; width:{width_pct}%"></div>'
+                        f'{target_marker}{target_sublabel}</div>',
+                        unsafe_allow_html=True,
+                    )
+                with c3:
+                    st.markdown(
+                        f'<div class="sector-bar-pct"><span class="cur">{pct:.1f}%</span>{delta_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                if is_open:
+                    st.markdown(
+                        f'<div class="sector-stock-names">{sec_stocks.get(name, "")}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if not sec_hist.empty and name in sec_hist["섹터그룹"].unique():
+                        series = sec_hist[sec_hist["섹터그룹"] == name].sort_values("날짜")
+                        dates = series["날짜"].tolist()
+                        vals = series["비중"].tolist()
+
+                        fig2, ax2 = plt.subplots(figsize=(4.6, 2.2))
+                        fig2.patch.set_alpha(0)
+                        ax2.set_facecolor("none")
+                        x2 = list(range(len(dates)))
+                        ax2.plot(x2, vals, color=color, linewidth=2.0, marker="o", markersize=3)
+                        ax2.plot([x2[-1]], [vals[-1]], marker="o", markersize=7, color=color)
+                        for xi, yi in zip(x2, vals):
+                            ax2.annotate(f"{yi:.1f}%", (xi, yi), textcoords="offset points", xytext=(0, 7),
+                                         ha="center", fontsize=8, color=T["text"])
+                        if target is not None:
+                            ax2.axhline(target, color=T["muted2"], linewidth=1, linestyle="--")
+                        ax2.set_ylim(0, 40)
+                        ax2.set_xticks(x2)
+                        ax2.set_xticklabels([d[5:] for d in dates], fontsize=8, color=T["muted"])
+                        ax2.tick_params(axis="y", labelsize=8, colors=T["muted"])
+                        for spine in ax2.spines.values():
+                            spine.set_visible(False)
+                        ax2.grid(axis="y", color=T["border"], linewidth=0.6)
+                        st.pyplot(fig2, use_container_width=True)
+                        plt.close(fig2)
+                    else:
+                        st.info("시세 새로고침 또는 거래 기록을 하면 그날의 섹터 비중이 저장되어 추이가 쌓입니다.")
+
+    # ---- Up/Down: 청산 종목 추적 ----
+    with st.expander("Up/Down", expanded=False):
+        mode = st.radio("모드", ["DOWN", "UP"], horizontal=True,
+                         label_visibility="collapsed", key="updown_mode")
+
+        if st.button("새로고침", key="updown_refresh", use_container_width=True):
+            closed = get_closed_out_last_sells(holdings, tx)
+            results = []
+            if not closed.empty:
+                with st.spinner("청산 종목 현재가 조회 중..."):
+                    prices = get_current_prices_for_names(closed["종목명"].tolist())
+                for _, row in closed.iterrows():
+                    cp = prices.get(row["종목명"])
+                    if cp is None:
+                        continue
+                    pct = (cp - row["매도가"]) / row["매도가"] * 100
+                    results.append({
+                        "종목명": row["종목명"], "매도일": row["매도일"],
+                        "매도가": row["매도가"], "현재가": cp, "pct": pct,
+                    })
+            st.session_state["updown_results"] = results
+            st.session_state["updown_checked_at"] = now_kst_str()
+            st.rerun()
+
+        results = st.session_state.get("updown_results")
+        checked_at = st.session_state.get("updown_checked_at")
+
+        if results is None:
+            st.caption("새로고침을 누르면 청산(완전 매도)된 종목의 현재가를 마지막 매도가와 비교합니다.")
+        else:
+            if checked_at:
+                st.caption(f"마지막 조회: {checked_at}")
+            threshold = 3.0
+            if mode == "DOWN":
+                filtered = sorted([r for r in results if r["pct"] <= -threshold], key=lambda r: r["pct"])
+                color = DOWN_COLOR
+            else:
+                filtered = sorted([r for r in results if r["pct"] >= threshold], key=lambda r: -r["pct"])
+                color = UP_COLOR
+
+            if not filtered:
+                st.caption("조건에 해당하는 종목이 없습니다.")
+            else:
+                rows_html = "".join(
+                    f'<div class="updown-row"><span class="name">{r["종목명"]}</span>'
+                    f'<span class="pct" style="color:{color}">{"+" if r["pct"] >= 0 else ""}{r["pct"]:.1f}%</span>'
+                    f'<span class="detail">{r["매도가"]:,.0f} → {r["현재가"]:,.0f}</span></div>'
+                    for r in filtered
+                )
+                st.markdown(rows_html, unsafe_allow_html=True)
 
     # ---- 종목별 보유현황 ----
     SORT_OPTIONS = {"비중": "weight", "섹터": "sector", "현재가": "price",
@@ -754,7 +1312,7 @@ with tab_port:
     rows = df_sorted.to_dict("records")
 
     if not rows:
-        st.info("보유 종목이 없습니다. 아래 '종목 편집'에서 추가하거나, '거래 기록' 탭에서 매수를 기록해보세요.")
+        st.info("보유 종목이 없습니다. '거래 기록' 탭에서 매수를 기록해보세요.")
     else:
         for r in rows:
             pc = UP_COLOR if r["손익"] >= 0 else DOWN_COLOR
@@ -782,41 +1340,9 @@ with tab_port:
             </div>
             """, unsafe_allow_html=True)
 
-    # ---- 새로고침 / 종목 편집 ----
-    col_r, col_e = st.columns([1, 1])
-    with col_r:
-        refresh_clicked = st.button("시세 새로고침", use_container_width=True, key="refresh_btn")
-    with col_e:
-        with st.popover("종목 편집", use_container_width=True):
-            st.caption("종목코드는 몰라도 됩니다 — 종목명만 정확히 입력하면 새로고침할 때 자동으로 찾아옵니다.")
-            edited = st.data_editor(
-                holdings,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_order=EDIT_COLUMNS,
-                column_config={
-                    "종목명": st.column_config.TextColumn(required=True, help="정확한 종목명을 입력하세요 (예: 삼성전자)"),
-                    "섹터": st.column_config.TextColumn(),
-                    "수량": st.column_config.NumberColumn(min_value=0, step=1),
-                    "평단가": st.column_config.NumberColumn(min_value=0, step=100, format="%.0f"),
-                    "현재가": st.column_config.NumberColumn(min_value=0, step=100, format="%.0f"),
-                },
-                key="editor",
-            )
-            if st.button("저장", use_container_width=True, key="save_edit_btn"):
-                save_holdings(edited)
-                st.success("저장했습니다.")
-                st.rerun()
+    # (시세 새로고침 버튼은 상단으로 이동했습니다)
 
-    if refresh_clicked:
-        with st.spinner("종목명으로 시세를 찾는 중..."):
-            holdings = refresh_all_prices(holdings)
-            df2, stock_val2, total_assets2, unreal2 = compute_metrics(holdings, state["cash"])
-            adjusted2 = total_assets2 + unreal2
-            snapshot_history(total_assets2, adjusted2)
-        st.rerun()
 
-    st.caption("시세는 네이버 금융 비공식 API 기준이며 지연/실패할 수 있습니다.")
 
 # ==================================================================== #
 # 탭 2: 거래 기록 + 자산 추이
@@ -886,62 +1412,89 @@ with tab_tx:
 
     st.divider()
 
-    # ---- 새 거래 기록 ----
-    st.markdown("##### 새 거래 기록하기")
+    # ---- 매매일지 CSV 업로드 ----
+    st.markdown("##### 매매일지 업로드 (CSV)")
+    st.caption("같은 날짜에 다시 올리면 그날 내용은 최신 업로드로 교체되고, 다른 날짜 기록은 그대로 유지됩니다.")
 
-    existing_names = sorted(holdings["종목명"].dropna().astype(str).replace("", pd.NA).dropna().unique().tolist())
-    name_options = existing_names + ["기타 (직접 입력)"]
+    up_file = st.file_uploader("CSV 파일 선택", type=["csv"], key="daily_csv_uploader")
+    up_date = st.date_input("거래 날짜", value=date.today(), key="daily_csv_date")
 
-    if "tx_selected_name" not in st.session_state or st.session_state.tx_selected_name not in name_options:
-        st.session_state.tx_selected_name = name_options[0] if name_options else ""
+    if up_file is not None:
+        file_bytes = up_file.getvalue()
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        import_log = load_import_log()
+        already = file_hash in import_log["hash"].values
 
-    with st.popover(f"종목명: {st.session_state.tx_selected_name or '선택'}", use_container_width=True):
-        st.caption("보유 종목 중에서 선택하거나, 맨 아래 '기타'를 골라 새 종목명을 입력하세요.")
-        picked = st.radio("종목 목록", name_options, label_visibility="collapsed", key="tx_name_radio_inner")
-        st.session_state.tx_selected_name = picked
-
-    name_choice = st.session_state.tx_selected_name
-    if name_choice == "기타 (직접 입력)":
-        tx_name_input = st.text_input("새 종목명", placeholder="예: 삼성전자", key="tx_name_custom")
-    else:
-        tx_name_input = name_choice
-
-    with st.form("tx_form", clear_on_submit=True):
-        c1, c2 = st.columns(2)
-        with c1:
-            tx_date = st.date_input("날짜", value=date.today())
-        with c2:
-            tx_kind = st.radio("구분", ["매수", "매도"], horizontal=True)
-            tx_qty = st.number_input("수량", min_value=0, step=1)
-        tx_price = st.number_input("단가", min_value=0, step=100)
-        tx_memo = st.text_input("메모 (선택)", placeholder="예: 분할매수 1차")
-        submitted = st.form_submit_button("기록 저장", use_container_width=True)
-
-    if submitted:
-        tx_name = (tx_name_input or "").strip()
-        if not tx_name or tx_qty <= 0 or tx_price <= 0:
-            st.error("종목명, 수량, 단가를 정확히 입력해주세요.")
+        if already:
+            st.warning("이 파일은 이미 반영된 것 같아요 (동일 파일이 감지됨).")
+            force = st.checkbox("그래도 다시 반영하기", key="daily_csv_force")
         else:
-            holdings2, state2, realized = apply_transaction(holdings, state, tx_name.strip(), tx_kind, tx_qty, tx_price)
-            new_row = {
-                "id": str(uuid.uuid4())[:8], "날짜": tx_date.strftime("%Y-%m-%d"),
-                "종목명": tx_name.strip(), "구분": tx_kind, "수량": tx_qty, "단가": tx_price,
-                "실현손익": realized if realized is not None else "", "메모": tx_memo, "정산반영": True,
-            }
-            tx2 = pd.concat([tx, pd.DataFrame([new_row])], ignore_index=True)
+            force = True
 
-            save_holdings(holdings2)
-            save_state(state2)
-            save_transactions(tx2)
+        if st.button("반영하기", key="daily_csv_apply", use_container_width=True, disabled=(already and not force)):
+            try:
+                parsed = parse_broker_daily_csv(file_bytes)
+            except Exception as e:
+                st.error(f"CSV를 읽는 중 문제가 발생했어요: {e}")
+            else:
+                if parsed.empty:
+                    st.warning("파일에서 종목 데이터를 찾지 못했어요. 형식을 확인해주세요.")
+                else:
+                    trade_date_str = up_date.strftime("%Y-%m-%d")
+                    holdings2, state2, tx2, n, replaced = import_daily_trades(parsed, holdings, state, tx, trade_date_str)
+                    if n == 0:
+                        st.info("이 파일에는 매수/매도 내역이 없어요 (반영할 거래가 없음).")
+                    else:
+                        save_holdings(holdings2)
+                        save_state(state2)
+                        save_transactions(tx2)
 
-            df4, val4, total4, unreal4 = compute_metrics(holdings2, state2["cash"])
-            snapshot_history(total4, total4 + unreal4)
+                        df5, val5, total5, unreal5 = compute_metrics(holdings2, state2["cash"])
+                        snapshot_history(total5, total5 + unreal5)
+                        snapshot_sector_history(compute_sector_weights(df5))
 
-            msg = f"{tx_kind} 기록 완료: {tx_name} {tx_qty:.0f}주 @ {tx_price:,.0f}원"
-            if realized is not None:
-                msg += f" (실현손익 {realized:+,.0f}원)"
-            st.success(msg)
+                        import_log = pd.concat([import_log, pd.DataFrame([{
+                            "hash": file_hash, "날짜": trade_date_str, "처리시각": now_kst_str(),
+                        }])], ignore_index=True)
+                        save_import_log(import_log)
+
+                        msg = f"{n}건의 거래를 반영했어요 ({trade_date_str} 기준)."
+                        if replaced:
+                            msg += f" (같은 날짜에 이미 있던 CSV 기록 {replaced}건은 이번 내용으로 교체됨)"
+                        st.success(msg)
+                        st.rerun()
+
+    with st.expander("포트폴리오 다시 계산하기 (문제 생겼을 때만)", expanded=False):
+        st.caption("보유 수량/현금이 이상하게 꼬였을 때 사용하세요. 거래 기록(transactions.csv) 전체를 "
+                   "처음부터 다시 재생해서 보유종목/현금/실현손익을 정확히 재계산합니다. "
+                   "거래 기록 자체는 지워지지 않습니다.")
+        if st.button("지금 다시 계산하기", key="rebuild_btn", use_container_width=True):
+            holdings_r, state_r, tx_r = rebuild_portfolio_from_transactions(tx, state.get("initial", 10_000_000.0))
+            save_holdings(holdings_r)
+            save_state(state_r)
+            save_transactions(tx_r)
+            df_r, val_r, total_r, unreal_r = compute_metrics(holdings_r, state_r["cash"])
+            snapshot_history(total_r, total_r + unreal_r)
+            snapshot_sector_history(compute_sector_weights(df_r))
+            st.success("거래 기록 기준으로 포트폴리오를 다시 계산했어요.")
             st.rerun()
+
+    with st.expander("GitHub 동기화 상태 (진단용)", expanded=False):
+        token_set, repo_set, branch_set, _ = _github_cfg()
+        if not token_set:
+            st.warning("GitHub secrets(token/repo)가 설정되어 있지 않아요 — 지금은 로컬 저장만 되고 있어요.")
+        else:
+            st.caption(f"레포: {repo_set} ({branch_set} 브랜치)로 동기화 중")
+        sync_log = st.session_state.get("github_sync_log", [])
+        if not sync_log:
+            st.caption("아직 이번 세션에서 GitHub 동기화가 시도된 적이 없어요.")
+        else:
+            for entry in reversed(sync_log[-15:]):
+                icon = "✅" if entry["ok"] else "❌"
+                line = f"{icon} [{entry['action']}] {entry['file']}"
+                if entry["detail"]:
+                    line += f" — {entry['detail']}"
+                st.caption(line)
 
     st.divider()
 

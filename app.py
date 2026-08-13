@@ -676,7 +676,7 @@ def import_daily_trades(parsed: pd.DataFrame, holdings: pd.DataFrame, state: dic
 # ------------------------------------------------------------------ #
 # 페이지 설정
 # ------------------------------------------------------------------ #
-st.set_page_config(page_title="SP Orchestra-test", page_icon="◆", layout="centered")
+st.set_page_config(page_title="SP Orchestra", page_icon="◆", layout="centered")
 
 if "theme" not in st.session_state:
     st.session_state["theme"] = "light"
@@ -1479,56 +1479,6 @@ with tab_tx:
             st.success("거래 기록 기준으로 포트폴리오를 다시 계산했어요.")
             st.rerun()
 
-# === [여기서부터 복사] 메리츠 앱 단가 동기화 블록 ===
-    with st.expander("🛠 메리츠 앱 단가와 완벽 동기화 (수동 보정)", expanded=False):
-        st.caption("증권사 수수료 등으로 틀어진 평단가를 실제 메리츠 앱과 똑같이 맞춥니다. (기존 계산 로직 100% 유지)")
-        
-        # 현재 보유 중인 종목만 선택지로 제공
-        held_stocks = holdings[holdings["수량"] > 0]["종목명"].tolist()
-        
-        if held_stocks:
-            fix_stock = st.selectbox("보정할 종목 선택", held_stocks, key="fix_stock_sel")
-            
-            # 선택한 종목의 현재 정보 가져오기
-            cur_info = holdings[holdings["종목명"] == fix_stock].iloc[0]
-            cur_qty = float(cur_info["수량"])
-            cur_avg = float(cur_info["평단가"])
-            
-            st.markdown(f"현재 파이썬이 인식한 평단가: **{cur_avg:,.0f}원** (보유수량: {cur_qty:.0f}주)")
-            new_avg = st.number_input("메리츠 앱에 표시된 진짜 평단가 입력", min_value=0.0, value=cur_avg, step=10.0, format="%.0f")
-            
-            if st.button("단가 동기화 적용", key="apply_fix_btn", use_container_width=True):
-                if new_avg != cur_avg and cur_qty > 0:
-                    d_str = today_kst_str()
-                    # 핵심 꼼수: 기존 평단가로 전량 매도(손익 0) 후 새로운 평단가로 전량 다시 매수
-                    fix_txs = pd.DataFrame([
-                        {"id": str(uuid.uuid4())[:8], "날짜": d_str, "종목명": fix_stock, "구분": "매도", "수량": cur_qty, "단가": cur_avg, "실현손익": 0.0, "메모": "평단가 수동보정 (기존단가 매도)", "정산반영": True},
-                        {"id": str(uuid.uuid4())[:8], "날짜": d_str, "종목명": fix_stock, "구분": "매수", "수량": cur_qty, "단가": new_avg, "실현손익": "", "메모": "평단가 수동보정 (실제단가 매수)", "정산반영": True}
-                    ])
-                    
-                    tx_updated = pd.concat([tx, fix_txs], ignore_index=True)
-                    
-                    # 기존에 있는 전체 재계산 함수(rebuild_portfolio_from_transactions) 재활용
-                    holdings_r, state_r, tx_r = rebuild_portfolio_from_transactions(tx_updated, state.get("initial", 10_000_000.0))
-                    
-                    # 변경된 데이터 저장
-                    save_holdings(holdings_r)
-                    save_state(state_r)
-                    save_transactions(tx_r)
-                    
-                    # 자산 추이 스냅샷 업데이트
-                    df_r, val_r, total_r, unreal_r = compute_metrics(holdings_r, state_r["cash"])
-                    snapshot_history(total_r, total_r + unreal_r)
-                    snapshot_sector_history(compute_sector_weights(df_r))
-                    
-                    st.success(f"{fix_stock}의 평단가가 {new_avg:,.0f}원으로 성공적으로 동기화되었어!")
-                    st.rerun()
-                elif new_avg == cur_avg:
-                    st.warning("기존 평단가와 다른 금액을 입력해줘.")
-        else:
-            st.info("현재 보유 중인 종목이 없어.")
-    # === [여기까지 복사] ===
-    
     with st.expander("GitHub 동기화 상태 (진단용)", expanded=False):
         token_set, repo_set, branch_set, _ = _github_cfg()
         if not token_set:

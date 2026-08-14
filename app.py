@@ -29,6 +29,8 @@ STATE_FILE = HERE / "account_state.csv"
 HISTORY_FILE = HERE / "asset_history.csv"
 SECTOR_HISTORY_FILE = HERE / "sector_history.csv"
 IMPORT_LOG_FILE = HERE / "import_log.csv"
+CODE_CACHE_FILE = HERE / "stock_code_cache.csv"
+SECTOR_CACHE_FILE = HERE / "stock_sector_cache.csv"
 
 HOLD_COLUMNS = ["종목명", "종목코드", "섹터", "수량", "평단가", "현재가", "등락률", "업데이트시각"]
 TX_COLUMNS = ["id", "날짜", "종목명", "구분", "수량", "단가", "실현손익", "메모", "정산반영"]
@@ -247,10 +249,11 @@ def load_holdings() -> pd.DataFrame:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0).astype(float)
         for col in ("종목명", "종목코드", "섹터", "업데이트시각"):
             df[col] = df[col].apply(clean_str)
-        # 미분류 종목명이 STOCK_SECTOR_MAP에 등록돼 있으면 자동으로 섹터 보정
-        needs_fix = (df["섹터"].isin(["", "미분류"])) & (df["종목명"].isin(STOCK_SECTOR_MAP.keys()))
+        # 미분류 종목이 저장된 섹터 캐시나 내장 매핑에 있으면 자동으로 섹터 보정
+        combined_map = {**STOCK_SECTOR_MAP, **load_sector_cache()}  # 캐시가 내장 매핑보다 우선
+        needs_fix = (df["섹터"].isin(["", "미분류"])) & (df["종목명"].isin(combined_map.keys()))
         if needs_fix.any():
-            df.loc[needs_fix, "섹터"] = df.loc[needs_fix, "종목명"].map(STOCK_SECTOR_MAP)
+            df.loc[needs_fix, "섹터"] = df.loc[needs_fix, "종목명"].map(combined_map)
         return df[HOLD_COLUMNS]
     return pd.DataFrame(columns=HOLD_COLUMNS)
 
@@ -445,15 +448,27 @@ def fetch_quotes(codes: list[str]) -> dict:
 
 def refresh_all_prices(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    code_cache = load_code_cache()
+    cache_dirty = False
     unresolved = []
     for i, row in df.iterrows():
         code = clean_str(row.get("종목코드", ""))
         if not code or code.lower() == "nan":
-            found = resolve_code(row["종목명"])
+            name = row["종목명"]
+            cached = code_cache.get(name, "")
+            if cached:
+                df.loc[i, "종목코드"] = cached
+                continue
+            found = resolve_code(name)
             if found:
                 df.loc[i, "종목코드"] = found
+                code_cache[name] = found
+                cache_dirty = True
             else:
-                unresolved.append(row["종목명"])
+                unresolved.append(name)
+
+    if cache_dirty:
+        save_code_cache(code_cache)
 
     codes = [clean_str(c) for c in df["종목코드"].tolist()]
     codes = [c for c in codes if c and c.lower() != "nan"]
@@ -519,7 +534,8 @@ def compute_sector_weights(df: pd.DataFrame) -> dict:
 # ------------------------------------------------------------------ #
 # 거래 반영 (매수/매도)
 # ------------------------------------------------------------------ #
-def apply_transaction(holdings: pd.DataFrame, state: dict, name: str, kind: str, qty: float, price: float):
+def apply_transaction(holdings: pd.DataFrame, state: dict, name: str, kind: str, qty: float, price: float,
+                       code_cache: dict | None = None, sector_cache: dict | None = None):
     holdings = holdings.copy()
     realized = None
     match = holdings.index[holdings["종목명"] == name]
@@ -539,7 +555,9 @@ def apply_transaction(holdings: pd.DataFrame, state: dict, name: str, kind: str,
                 holdings.loc[i, "현재가"] = price
         else:
             new_row = {c: "" for c in HOLD_COLUMNS}
-            new_row.update({"종목명": name, "종목코드": "", "섹터": STOCK_SECTOR_MAP.get(name, "미분류"),
+            cached_code = (code_cache or {}).get(name, "")
+            sector = (sector_cache or {}).get(name) or STOCK_SECTOR_MAP.get(name, "미분류")
+            new_row.update({"종목명": name, "종목코드": cached_code, "섹터": sector,
                              "수량": qty, "평단가": price, "현재가": price,
                              "등락률": 0, "업데이트시각": now_kst_str()})
             holdings = pd.concat([holdings, pd.DataFrame([new_row])], ignore_index=True)
@@ -573,6 +591,41 @@ def load_import_log() -> pd.DataFrame:
 def save_import_log(df: pd.DataFrame) -> None:
     df.to_csv(IMPORT_LOG_FILE, index=False)
     github_commit_file(IMPORT_LOG_FILE, "import_log.csv 업데이트")
+
+
+def load_code_cache() -> dict:
+    """종목명 → 종목코드 캐시. 보유종목이 거래기록 기준으로 재계산되어도
+    이미 찾아둔 종목코드는 여기서 즉시 복원해서, 매번 네이버에 재검색하지 않도록 한다."""
+    if not CODE_CACHE_FILE.exists():
+        github_fetch_file(CODE_CACHE_FILE)
+    if CODE_CACHE_FILE.exists():
+        df = pd.read_csv(CODE_CACHE_FILE, dtype=str)
+        return dict(zip(df["종목명"], df["종목코드"]))
+    return {}
+
+
+def save_code_cache(cache: dict) -> None:
+    df = pd.DataFrame(sorted(cache.items()), columns=["종목명", "종목코드"])
+    df.to_csv(CODE_CACHE_FILE, index=False)
+    github_commit_file(CODE_CACHE_FILE, "stock_code_cache.csv 업데이트")
+
+
+def load_sector_cache() -> dict:
+    """종목명 → 섹터 캐시. transactions.csv에는 섹터 정보가 없어서, 보유종목을
+    거래기록 기준으로 재계산할 때마다 섹터가 날아가는 걸 막기 위한 영구 저장소.
+    STOCK_SECTOR_MAP(내장 매핑)보다 우선 적용되며, 한번 배정된 섹터는 여기 계속 남는다."""
+    if not SECTOR_CACHE_FILE.exists():
+        github_fetch_file(SECTOR_CACHE_FILE)
+    if SECTOR_CACHE_FILE.exists():
+        df = pd.read_csv(SECTOR_CACHE_FILE, dtype=str)
+        return dict(zip(df["종목명"], df["섹터"]))
+    return {}
+
+
+def save_sector_cache(cache: dict) -> None:
+    df = pd.DataFrame(sorted(cache.items()), columns=["종목명", "섹터"])
+    df.to_csv(SECTOR_CACHE_FILE, index=False)
+    github_commit_file(SECTOR_CACHE_FILE, "stock_sector_cache.csv 업데이트")
 
 
 def parse_broker_daily_csv(raw: bytes) -> pd.DataFrame:
@@ -627,6 +680,9 @@ def rebuild_portfolio_from_transactions(tx: pd.DataFrame, initial_capital: float
     if tx.empty:
         return holdings, state, tx
 
+    code_cache = load_code_cache()  # 이미 찾아둔 종목코드는 재생 중에도 그대로 복원
+    sector_cache = load_sector_cache()  # 이미 배정된 섹터도 재생 중에 그대로 복원
+
     tx_sorted = tx.copy().reset_index(drop=True)
     tx_sorted["_ord"] = range(len(tx_sorted))
     tx_sorted = tx_sorted.sort_values(["날짜", "_ord"]).reset_index(drop=True)
@@ -637,7 +693,7 @@ def rebuild_portfolio_from_transactions(tx: pd.DataFrame, initial_capital: float
         kind = row["구분"]
         qty = float(row["수량"])
         price = float(row["단가"])
-        holdings, state, realized = apply_transaction(holdings, state, name, kind, qty, price)
+        holdings, state, realized = apply_transaction(holdings, state, name, kind, qty, price, code_cache, sector_cache)
         if kind == "매도":
             realized_map[row["id"]] = realized if realized is not None else 0.0
 
@@ -1486,6 +1542,39 @@ with tab_tx:
             snapshot_sector_history(compute_sector_weights(df_r))
             st.success("거래 기록 기준으로 포트폴리오를 다시 계산했어요.")
             st.rerun()
+
+    with st.expander("섹터 일괄 수정", expanded=False):
+        st.caption("여기서 지정한 섹터는 별도로 영구 저장되어, CSV 업로드나 재계산을 다시 해도 유지됩니다.")
+        current_names = sorted(holdings["종목명"].dropna().astype(str).unique().tolist())
+        if not current_names:
+            st.info("보유 종목이 없어요.")
+        else:
+            sector_cache_now = load_sector_cache()
+            rows_for_edit = []
+            for nm in current_names:
+                cur_sector = holdings.loc[holdings["종목명"] == nm, "섹터"]
+                cur_sector = cur_sector.iloc[0] if len(cur_sector) else ""
+                rows_for_edit.append({"종목명": nm, "섹터": cur_sector or "미분류"})
+            edit_df = pd.DataFrame(rows_for_edit)
+            edited = st.data_editor(
+                edit_df, use_container_width=True, hide_index=True, key="sector_bulk_editor",
+                column_config={
+                    "종목명": st.column_config.TextColumn(disabled=True),
+                    "섹터": st.column_config.TextColumn(),
+                },
+            )
+            if st.button("섹터 저장", key="save_sector_btn", use_container_width=True):
+                new_cache = load_sector_cache()
+                holdings_s = holdings.copy()
+                for _, r in edited.iterrows():
+                    sec = str(r["섹터"]).strip()
+                    if sec:
+                        new_cache[r["종목명"]] = sec
+                        holdings_s.loc[holdings_s["종목명"] == r["종목명"], "섹터"] = sec
+                save_sector_cache(new_cache)
+                save_holdings(holdings_s)
+                st.success("섹터를 저장했어요. 앞으로 CSV 업로드/재계산해도 유지됩니다.")
+                st.rerun()
 
     with st.expander("GitHub 동기화 상태 (진단용)", expanded=False):
         token_set, repo_set, branch_set, _ = _github_cfg()

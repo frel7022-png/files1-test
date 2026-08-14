@@ -87,37 +87,6 @@ STOCK_SECTOR_MAP = {
     "종근당": "제약바이오",
     "심텍": "반도체장비",
     "한화시스템": "지주(방산소재)",
-    "CJ대한통운": "물류",
-    "아세아제지": "제지",
-    "삼립": "식품",
-    "GS건설": "건설",
-    "GS리테일": "유통",
-    "성광벤드": "에너지기자재",
-    "한국단자": "전기전자부품",
-    "신세계인터내셔날": "유통",
-    "JYP Ent.": "엔터테인먼트",
-    "한국가스공사": "에너지",
-    "현대리바트": "가구",
-    "미스토홀딩스": "유통",
-    "AJ네트웍스": "렌탈서비스",
-    "CJ제일제당": "식품",
-    "아이센스": "의료기기",
-    "해태제과식품": "식품",
-    "영원무역": "섬유의류",
-    "메리츠금융지주": "금융",
-    "HK이노엔": "제약바이오",
-    "오스테오닉": "의료기기",
-    "JW생명과학": "제약바이오",
-    "실리콘투": "화장품",
-    "오리온": "식품",
-    "진에어": "항공",
-    "삼양패키징": "용기포장",
-    "더네이쳐홀딩스": "섬유의류",
-    "한일시멘트": "건자재",
-    "우리금융지주": "금융",
-    "카카오뱅크": "금융",
-    "KCC글라스": "건자재",
-    "동국제강": "철강",
 }
 
 # 섹터별 목표 비중(주식 총자산 대비, %). 아직 정하지 않은 섹터는 포함하지 않음 — 추후 추가.
@@ -427,42 +396,50 @@ def resolve_code(name: str):
 
 
 def fetch_quotes(codes: list[str]) -> dict:
+    """네이버 실시간 시세 API는 한 번에 너무 많은 종목코드를 요청하면 일부만 응답하는
+    경우가 있어(대략 20개 안팎에서 잘림), 20개씩 나눠서 요청한 뒤 결과를 합친다."""
     codes = [c for c in codes if c]
     if not codes:
         return {}
-    url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{','.join(codes)}"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=6)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as e:
-        st.warning(f"시세 조회 실패: {e}")
-        return {}
 
-    datas = payload.get("datas")
-    if datas is None:
-        try:
-            datas = payload["result"]["areas"][0]["datas"]
-        except Exception:
-            datas = []
-
+    CHUNK_SIZE = 20
     result = {}
-    for d in datas or []:
-        code = str(d.get("itemCode") or d.get("cd") or d.get("code") or "").strip()
-        price_raw = d.get("closePrice") or d.get("cv") or d.get("nv")
-        chg_raw = d.get("fluctuationsRatio") or d.get("cr")
-        if not code or price_raw is None:
-            continue
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.naver.com/"}
+
+    for i in range(0, len(codes), CHUNK_SIZE):
+        chunk = codes[i:i + CHUNK_SIZE]
+        url = f"https://polling.finance.naver.com/api/realtime/domestic/stock/{','.join(chunk)}"
         try:
-            price = float(str(price_raw).replace(",", ""))
-        except ValueError:
+            resp = requests.get(url, headers=headers, timeout=6)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception as e:
+            st.warning(f"시세 조회 실패({i + 1}~{i + len(chunk)}번째 종목): {e}")
             continue
-        try:
-            change_pct = float(str(chg_raw).replace(",", "").replace("%", "")) if chg_raw is not None else 0.0
-        except ValueError:
-            change_pct = 0.0
-        result[code] = {"price": price, "change_pct": change_pct}
+
+        datas = payload.get("datas")
+        if datas is None:
+            try:
+                datas = payload["result"]["areas"][0]["datas"]
+            except Exception:
+                datas = []
+
+        for d in datas or []:
+            code = str(d.get("itemCode") or d.get("cd") or d.get("code") or "").strip()
+            price_raw = d.get("closePrice") or d.get("cv") or d.get("nv")
+            chg_raw = d.get("fluctuationsRatio") or d.get("cr")
+            if not code or price_raw is None:
+                continue
+            try:
+                price = float(str(price_raw).replace(",", ""))
+            except ValueError:
+                continue
+            try:
+                change_pct = float(str(chg_raw).replace(",", "").replace("%", "")) if chg_raw is not None else 0.0
+            except ValueError:
+                change_pct = 0.0
+            result[code] = {"price": price, "change_pct": change_pct}
+
     return result
 
 
